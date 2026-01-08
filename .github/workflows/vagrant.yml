@@ -1,307 +1,258 @@
-name: Build and Publish Vagrant Box
-
+# Workflow: Build and publish Vagrant box with Packer
+# - Requires a runner that already has fixed versions of packer, vagrant, hcp (HashiCorp) and VirtualBox if needed.
+# - Two token modes:
+#    1) OIDC → HCP exchange (recommended for automatic auth). Requires configuration on HCP side (audience / trust)
+#    2) Pre-created HCP API token stored as secret HCP_API_TOKEN
+#
+# Inputs (workflow_dispatch):
+# - box_name: the full Vagrant Cloud box name in form "<vagrant-username>/<box-name>"
+# - box_version: version string to publish (e.g. "1.0.0")
+#
+# Required secrets (one of the following):
+# - HCP_API_TOKEN (simpler)   OR
+# - HCP_OIDC_AUDIENCE and HCP_TOKEN_EXCHANGE_ENDPOINT (and additional HCP client setup) — see notes below
+#
 on:
   push:
-    branches:
-      - main
-    #   - develop
-    # paths:
-    #   - 'packer-template.json'
-    #   - 'packer-template.pkr.hcl'
-    #   - 'scripts/**'
-    #   - '.github/workflows/vagrant-build.yml'
-  
+    branches: ["main"]
   workflow_dispatch:
     inputs:
       box_name:
-        description: 'Vagrant box name (e.g., username/boxname)'
+        description: 'Full Vagrant Cloud box name (user/box). Example: myuser/mybox'
         required: true
-        type: string
       box_version:
-        description: 'Box version (e.g., 1.0.0)'
+        description: 'Version to publish. Example: 1.0.0'
         required: true
-        type: string
-      provider:
-        description: 'Vagrant provider'
-        required: false
-        default: 'virtualbox'
-        type: choice
-        options:
-          - virtualbox
-          - vmware_desktop
-          - libvirt
+
+permissions:
+  contents: read
+  id-token: write  # needed if using OIDC exchange mode
 
 env:
-  PACKER_VERSION: '1.10.1'
-  VAGRANT_VERSION: '2.4.1'
-  HCP_VERSION: '0.4.0'
+  # Fixed versions — document what you expect the runner to provide.
+  PACKER_VERSION: "1.9.3"   # adjust to the version preinstalled on the runner
+  VAGRANT_VERSION: "2.3.7"  # adjust to the version preinstalled on the runner
+  HCP_CLI_VERSION: "0.1.0"  # adjust accordingly
+  PACKER_TEMPLATE: "packer-template.json"
 
 jobs:
   build-and-publish:
-    name: Build and Publish Vagrant Box
-    runs-on: ubuntu-latest
-    
+    name: Build with Packer and publish to Vagrant Cloud
+    # NOTE: Use a self-hosted runner image that includes packer, vagrant, virtualbox and hcp CLI
+    # Example: runs-on: [self-hosted, linux, packer-vagrant]
+    runs-on: [self-hosted, linux, packer-vagrant]
+    # If you don't have a self-hosted runner, switch to ubuntu-latest and add installation steps (not shown here to match "preinstalled" requirement).
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+    - name: Checkout repository
+      uses: actions/checkout@v4
 
-      - name: Cache Packer plugins
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.config/packer/plugins
-            ~/.packer.d/plugins
-          key: ${{ runner.os }}-packer-${{ env.PACKER_VERSION }}-${{ hashFiles('packer-template.json', 'packer-template.pkr.hcl') }}
-          restore-keys: |
-            ${{ runner.os }}-packer-${{ env.PACKER_VERSION }}-
+    - name: Validate inputs and set variables
+      id: vars
+      run: |
+        # prefer workflow_dispatch inputs, fallback to env/GITHUB_REF (shouldn't be needed)
+        BOX_NAME="${{ github.event.inputs.box_name }}"
+        BOX_VERSION="${{ github.event.inputs.box_version }}"
+        if [ -z "$BOX_NAME" ] || [ -z "$BOX_VERSION" ]; then
+          echo "ERROR: box_name and box_version must be provided (via workflow_dispatch or event inputs)."
+          exit 1
+        fi
+        echo "box_name=$BOX_NAME" >> $GITHUB_OUTPUT
+        echo "box_version=$BOX_VERSION" >> $GITHUB_OUTPUT
 
-      - name: Setup Packer
-        uses: hashicorp/setup-packer@main
-        with:
-          version: ${{ env.PACKER_VERSION }}
+    - name: Check required tools and versions (packer, vagrant, hcp)
+      run: |
+        echo "Expecting preinstalled versions (env): PACKER:${PACKER_VERSION}, VAGRANT:${VAGRANT_VERSION}, HCP:${HCP_CLI_VERSION}"
+        echo "---- packer version ----"
+        if command -v packer >/dev/null 2>&1; then packer --version; else echo "packer not found"; fi
+        echo "---- vagrant version ----"
+        if command -v vagrant >/dev/null 2>&1; then vagrant --version; else echo "vagrant not found"; fi
+        echo "---- hcp / hcp-cli version ----"
+        if command -v hcp >/dev/null 2>&1; then hcp version || true; elif command -v hcp-cli >/dev/null 2>&1; then hcp-cli version || true; else echo "hcp cli not found"; fi
 
-      - name: Setup Vagrant
-        run: |
-          if ! command -v vagrant &> /dev/null || [ "$(vagrant --version | awk '{print $2}')" != "${{ env.VAGRANT_VERSION }}" ]; then
-            wget -q https://releases.hashicorp.com/vagrant/${{ env.VAGRANT_VERSION }}/vagrant_${{ env.VAGRANT_VERSION }}-1_amd64.deb
-            sudo dpkg -i vagrant_${{ env.VAGRANT_VERSION }}-1_amd64.deb
-            rm vagrant_${{ env.VAGRANT_VERSION }}-1_amd64.deb
-          fi
-          vagrant --version
+    - name: Acquire VAGRANT_CLOUD_TOKEN (HCP) — OIDC exchange or secret fallback
+      id: get_token
+      env:
+        ACTIONS_ID_TOKEN_REQUEST_URL: ${{ env.ACTIONS_ID_TOKEN_REQUEST_URL }}
+        ACTIONS_ID_TOKEN_REQUEST_TOKEN: ${{ env.ACTIONS_ID_TOKEN_REQUEST_TOKEN }}
+      run: |
+        # Strategy:
+        # 1) If repo secret HCP_API_TOKEN exists, use it directly (simple)
+        # 2) Else attempt OIDC exchange with HCP (requires HCP side config).
+        # You must provide either:
+        # - a repository secret named HCP_API_TOKEN (recommended quick start), OR
+        # - HCP-side OAuth/OIDC trust so GitHub Actions OIDC token can be exchanged for an HCP token.
+        #
+        # If using OIDC exchange you will need to configure:
+        # - HCP to trust GitHub OIDC for an audience (e.g. "github_actions_hcp")
+        # - HCP token exchange endpoint / client configuration — adapt the below to your HCP endpoint and parameters.
+        #
+        if [ -n "${{ secrets.HCP_API_TOKEN }}" ]; then
+          echo "Using pre-provisioned HCP API token from secret HCP_API_TOKEN"
+          echo "vagrant_cloud_token=${{ secrets.HCP_API_TOKEN }}" >> $GITHUB_OUTPUT
+          exit 0
+        fi
 
-      - name: Setup HCP CLI
-        run: |
-          if ! command -v hcp &> /dev/null; then
-            echo "📦 Installing HCP CLI ${{ env.HCP_VERSION }}..."
-            wget -q https://releases.hashicorp.com/hcp/${{ env.HCP_VERSION }}/hcp_${{ env.HCP_VERSION }}_linux_amd64.zip
-            unzip -q hcp_${{ env.HCP_VERSION }}_linux_amd64.zip
-            sudo mv hcp /usr/local/bin/
-            rm hcp_${{ env.HCP_VERSION }}_linux_amd64.zip
-          fi
-          hcp version
+        # If no HCP_API_TOKEN, try OIDC exchange. The exact HTTP call depends on how you configured HCP.
+        # We attempt to request a GitHub OIDC ID token for an audience defined in HCP_OIDC_AUDIENCE.
+        if [ -z "${{ secrets.HCP_OIDC_AUDIENCE }}" ] || [ -z "${{ secrets.HCP_TOKEN_EXCHANGE_ENDPOINT }}" ]; then
+          echo "No HCP_API_TOKEN secret and no OIDC exchange configuration (HCP_OIDC_AUDIENCE / HCP_TOKEN_EXCHANGE_ENDPOINT)."
+          echo "Set the secret HCP_API_TOKEN or configure OIDC exchange and rerun."
+          exit 1
+        fi
 
-      - name: Authenticate with HCP and get Vagrant Cloud token
-        id: hcp-auth
-        env:
-          HCP_CLIENT_ID: ${{ secrets.HCP_CLIENT_ID }}
-          HCP_CLIENT_SECRET: ${{ secrets.HCP_CLIENT_SECRET }}
-        run: |
-          echo "🔐 Authenticating with HCP..."
-          hcp auth login \
-            --client-id="${HCP_CLIENT_ID}" \
-            --client-secret="${HCP_CLIENT_SECRET}"
-          
-          echo "🎫 Retrieving HCP access token..."
-          HCP_TOKEN=$(hcp auth print-access-token)
-          
-          if [ -z "$HCP_TOKEN" ] || [ "$HCP_TOKEN" = "null" ]; then
-            echo "❌ Failed to retrieve HCP access token"
-            exit 1
-          fi
-          
-          TOKEN_LENGTH=$(echo "$HCP_TOKEN" | wc -c)
-          echo "✅ Successfully retrieved HCP token (${TOKEN_LENGTH} characters)"
-          
-          echo "🔄 Setting VAGRANT_CLOUD_TOKEN from HCP token..."
-          echo "VAGRANT_CLOUD_TOKEN=${HCP_TOKEN}" >> $GITHUB_ENV
-          echo "::add-mask::${HCP_TOKEN}"
+        echo "Requesting GitHub OIDC ID token for audience: ${{ secrets.HCP_OIDC_AUDIENCE }}"
+        # Request the GitHub Actions OIDC token
+        # Docs: https://docs.github.com/en/actions/deployment/security-hardening-your-deployments/about-security-hardening-with-openid-connect
+        OIDC_URL="${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${{ secrets.HCP_OIDC_AUDIENCE }}"
+        OIDC_RESP=$(curl -sSX POST -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" "${OIDC_URL}")
+        ID_TOKEN=$(echo "$OIDC_RESP" | jq -r .value)
+        if [ -z "$ID_TOKEN" ] || [ "$ID_TOKEN" = "null" ]; then
+          echo "Failed to obtain OIDC ID token from GitHub Actions."
+          echo "Response: $OIDC_RESP"
+          exit 1
+        fi
 
-      - name: Set box metadata
-        id: box-metadata
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            BOX_NAME="${{ inputs.box_name }}"
-            BOX_VERSION="${{ inputs.box_version }}"
-            PROVIDER="${{ inputs.provider }}"
-          else
-            # Default values for push events
-            BOX_NAME="${{ secrets.DEFAULT_BOX_NAME }}"
-            BOX_VERSION="$(date +%Y.%m.%d)-${GITHUB_SHA::7}"
-            PROVIDER="virtualbox"
-          fi
-          
-          echo "box_name=${BOX_NAME}" >> $GITHUB_OUTPUT
-          echo "box_version=${BOX_VERSION}" >> $GITHUB_OUTPUT
-          echo "provider=${PROVIDER}" >> $GITHUB_OUTPUT
-          
-          echo "📦 Box Name: ${BOX_NAME}"
-          echo "🏷️  Version: ${BOX_VERSION}"
-          echo "🔧 Provider: ${PROVIDER}"
+        echo "Exchanging OIDC token with HCP token exchange endpoint..."
+        # Exchange the ID token for an HCP token (example POST, adapt per your HCP setup)
+        # Requires you to provide HCP_TOKEN_EXCHANGE_ENDPOINT as a repository secret
+        EXCHANGE_ENDPOINT="${{ secrets.HCP_TOKEN_EXCHANGE_ENDPOINT }}"
+        # Example payload — adapt to HCP token exchange API (grant_type, client_id, etc.)
+        RESP=$(curl -sSX POST "${EXCHANGE_ENDPOINT}" \
+          -H "Content-Type: application/json" \
+          -d "{\"subject_token\":\"$ID_TOKEN\",\"subject_token_type\":\"urn:ietf:params:oauth:token-type:jwt\"}")
+        # Extract token from response — adjust jq path depending on HCP response structure
+        HCP_TOKEN=$(echo "$RESP" | jq -r '.access_token // .token // .value')
+        if [ -z "$HCP_TOKEN" ] || [ "$HCP_TOKEN" = "null" ]; then
+          echo "Failed to exchange OIDC token for HCP token. Response:"
+          echo "$RESP"
+          exit 1
+        fi
+        echo "vagrant_cloud_token=$HCP_TOKEN" >> $GITHUB_OUTPUT
 
-      - name: Initialize Packer
-        run: |
-          packer init .
+    - name: Export VAGRANT_CLOUD_TOKEN
+      run: |
+        echo "VAGRANT_CLOUD_TOKEN='${{ steps.get_token.outputs.vagrant_cloud_token }}'"
+        echo "VAGRANT_CLOUD_TOKEN=${{ steps.get_token.outputs.vagrant_cloud_token }}" >> $GITHUB_ENV
 
-      - name: Validate Packer template
-        run: |
-          if [ -f "packer-template.pkr.hcl" ]; then
-            packer validate -var "box_version=${{ steps.box-metadata.outputs.box_version }}" packer-template.pkr.hcl
-          elif [ -f "packer-template.json" ]; then
-            packer validate -var "box_version=${{ steps.box-metadata.outputs.box_version }}" packer-template.json
-          else
-            echo "❌ No Packer template found"
-            exit 1
-          fi
+    - name: Validate Packer template
+      run: |
+        if [ ! -f "${{ env.PACKER_TEMPLATE }}" ]; then
+          echo "ERROR: packer template '${{ env.PACKER_TEMPLATE }}' not found in the repository root."
+          ls -la
+          exit 1
+        fi
+        packer validate "${{ env.PACKER_TEMPLATE }}"
 
-      - name: Build Vagrant box with Packer
-        env:
-          PACKER_LOG: 1
-          PACKER_LOG_PATH: packer-build.log
-        run: |
-          echo "🔨 Building Vagrant box..."
-          
-          if [ -f "packer-template.pkr.hcl" ]; then
-            TEMPLATE="packer-template.pkr.hcl"
-          else
-            TEMPLATE="packer-template.json"
-          fi
-          
-          packer build \
-            -var "box_version=${{ steps.box-metadata.outputs.box_version }}" \
-            -var "vagrant_cloud_token=${VAGRANT_CLOUD_TOKEN}" \
-            -force \
-            "${TEMPLATE}"
+    - name: Build box with Packer
+      id: packer_build
+      run: |
+        set -euo pipefail
+        BOX_NAME="${{ steps.vars.outputs.box_name }}"
+        BOX_VERSION="${{ steps.vars.outputs.box_version }}"
+        echo "Running packer build for box=$BOX_NAME version=$BOX_VERSION"
+        # If your packer template requires variables, pass them here. Example:
+        # packer build -var "box_name=${BOX_NAME}" -var "box_version=${BOX_VERSION}" packer-template.json
+        packer build \
+          -var "box_name=${BOX_NAME}" \
+          -var "box_version=${BOX_VERSION}" \
+          "${{ env.PACKER_TEMPLATE }}"
 
-      - name: Verify box file exists
-        id: verify-box
-        run: |
-          BOX_FILE=$(find . -name "*.box" -type f | head -n 1)
-          
-          if [ -z "$BOX_FILE" ]; then
-            echo "❌ No .box file found after build"
-            exit 1
-          fi
-          
-          BOX_SIZE=$(du -h "$BOX_FILE" | cut -f1)
-          echo "✅ Box file found: $BOX_FILE ($BOX_SIZE)"
-          echo "box_file=${BOX_FILE}" >> $GITHUB_OUTPUT
+        # Find the generated .box file
+        BOX_FILE=$(find . -type f -name "*.box" -print -quit || true)
+        if [ -z "$BOX_FILE" ]; then
+          echo "ERROR: No .box file produced by packer build"
+          exit 1
+        fi
+        echo "Produced box file: $BOX_FILE"
+        echo "box_file=$BOX_FILE" >> $GITHUB_OUTPUT
 
-      - name: Create or update Vagrant Cloud box
-        env:
-          VAGRANT_CLOUD_TOKEN: ${{ env.VAGRANT_CLOUD_TOKEN }}
-        run: |
-          BOX_NAME="${{ steps.box-metadata.outputs.box_name }}"
-          BOX_VERSION="${{ steps.box-metadata.outputs.box_version }}"
-          
-          # Check if box exists
-          if curl -sf -H "Authorization: Bearer ${VAGRANT_CLOUD_TOKEN}" \
-            "https://app.vagrantup.com/api/v2/box/${BOX_NAME}" > /dev/null 2>&1; then
-            echo "📦 Box exists, will create new version"
-          else
-            echo "🆕 Creating new box on Vagrant Cloud"
-            curl -X POST \
-              -H "Authorization: Bearer ${VAGRANT_CLOUD_TOKEN}" \
-              -H "Content-Type: application/json" \
-              -d "{\"box\":{\"username\":\"$(echo $BOX_NAME | cut -d'/' -f1)\",\"name\":\"$(echo $BOX_NAME | cut -d'/' -f2)\",\"is_private\":false}}" \
-              "https://app.vagrantup.com/api/v2/boxes"
-          fi
+    - name: Publish box to Vagrant Cloud
+      id: publish
+      env:
+        VAGRANT_CLOUD_TOKEN: ${{ env.VAGRANT_CLOUD_TOKEN }}
+      run: |
+        set -euo pipefail
+        BOX_NAME="${{ steps.vars.outputs.box_name }}"   # expected as user/box
+        BOX_VERSION="${{ steps.vars.outputs.box_version }}"
+        BOX_FILE="${{ steps.packer_build.outputs.box_file }}"
+        if [ -z "$BOX_FILE" ]; then
+          echo "ERROR: box file path missing"
+          exit 1
+        fi
+        echo "Will publish $BOX_FILE as $BOX_NAME version $BOX_VERSION"
 
-      - name: Create new version
-        env:
-          VAGRANT_CLOUD_TOKEN: ${{ env.VAGRANT_CLOUD_TOKEN }}
-        run: |
-          BOX_NAME="${{ steps.box-metadata.outputs.box_name }}"
-          BOX_VERSION="${{ steps.box-metadata.outputs.box_version }}"
-          
-          echo "🏷️  Creating version ${BOX_VERSION}"
-          curl -X POST \
-            -H "Authorization: Bearer ${VAGRANT_CLOUD_TOKEN}" \
-            -H "Content-Type: application/json" \
-            -d "{\"version\":{\"version\":\"${BOX_VERSION}\",\"description\":\"Built from GitHub Actions on $(date -u +%Y-%m-%d)\"}}" \
-            "https://app.vagrantup.com/api/v2/box/${BOX_NAME}/versions"
+        # If vagrant CLI is available and supports `vagrant cloud publish`:
+        if command -v vagrant >/dev/null 2>&1; then
+          echo "Using vagrant CLI to publish"
+          # vagrant cloud publish <user>/<box> <version> <provider> <box_file> --token <token> --release
+          # The provider below should match what packer produced (e.g. virtualbox)
+          PROVIDER="${{ secrets.PACKER_PROVIDER || 'virtualbox' }}"
+          # Ensure PROVIDER is set in secrets or change default above
+          vagrant cloud publish "$BOX_NAME" "$BOX_VERSION" "$PROVIDER" "$BOX_FILE" --token "$VAGRANT_CLOUD_TOKEN" --release --force
+          echo "Published with vagrant CLI"
+          exit 0
+        fi
 
-      - name: Create provider
-        env:
-          VAGRANT_CLOUD_TOKEN: ${{ env.VAGRANT_CLOUD_TOKEN }}
-        run: |
-          BOX_NAME="${{ steps.box-metadata.outputs.box_name }}"
-          BOX_VERSION="${{ steps.box-metadata.outputs.box_version }}"
-          PROVIDER="${{ steps.box-metadata.outputs.provider }}"
-          
-          echo "🔧 Creating provider ${PROVIDER}"
-          curl -X POST \
-            -H "Authorization: Bearer ${VAGRANT_CLOUD_TOKEN}" \
-            -H "Content-Type: application/json" \
-            -d "{\"provider\":{\"name\":\"${PROVIDER}\"}}" \
-            "https://app.vagrantup.com/api/v2/box/${BOX_NAME}/version/${BOX_VERSION}/providers"
+        # Fallback: use Vagrant Cloud API (simple flow). This is a minimal example and may require adjustments
+        # Create version and provider, then upload file in two-step process. See Vagrant Cloud API docs for full details.
+        echo "vagrant CLI not found, attempting to use Vagrant Cloud API (fallback)."
+        API_BASE="https://app.vagrantup.com/api/v1"
+        USER=$(echo "$BOX_NAME" | cut -d'/' -f1)
+        BOX=$(echo "$BOX_NAME" | cut -d'/' -f2)
+        PROVIDER="${{ secrets.PACKER_PROVIDER || 'virtualbox' }}"
 
-      - name: Upload box to Vagrant Cloud
-        env:
-          VAGRANT_CLOUD_TOKEN: ${{ env.VAGRANT_CLOUD_TOKEN }}
-        run: |
-          BOX_NAME="${{ steps.box-metadata.outputs.box_name }}"
-          BOX_VERSION="${{ steps.box-metadata.outputs.box_version }}"
-          PROVIDER="${{ steps.box-metadata.outputs.provider }}"
-          BOX_FILE="${{ steps.verify-box.outputs.box_file }}"
-          
-          echo "⬆️  Getting upload URL..."
-          UPLOAD_PATH=$(curl -s \
-            -H "Authorization: Bearer ${VAGRANT_CLOUD_TOKEN}" \
-            "https://app.vagrantup.com/api/v2/box/${BOX_NAME}/version/${BOX_VERSION}/provider/${PROVIDER}/upload" \
-            | jq -r '.upload_path')
-          
-          echo "📤 Uploading box file..."
-          curl -X PUT \
-            --upload-file "${BOX_FILE}" \
-            "${UPLOAD_PATH}"
-          
-          echo "✅ Upload complete"
+        # 1) Create version
+        echo "Creating version $BOX_VERSION"
+        curl -sSX POST "${API_BASE}/boxes/${USER}/${BOX}/versions" \
+          -H "Authorization: Bearer $VAGRANT_CLOUD_TOKEN" \
+          -H "Content-Type: application/json" \
+          -d "{\"version\": {\"version\": \"${BOX_VERSION}\"}}" | jq .
 
-      - name: Release version
-        env:
-          VAGRANT_CLOUD_TOKEN: ${{ env.VAGRANT_CLOUD_TOKEN }}
-        run: |
-          BOX_NAME="${{ steps.box-metadata.outputs.box_name }}"
-          BOX_VERSION="${{ steps.box-metadata.outputs.box_version }}"
-          
-          echo "🚀 Releasing version ${BOX_VERSION}"
-          curl -X PUT \
-            -H "Authorization: Bearer ${VAGRANT_CLOUD_TOKEN}" \
-            "https://app.vagrantup.com/api/v2/box/${BOX_NAME}/version/${BOX_VERSION}/release"
-          
-          echo "✅ Version released successfully!"
-          echo "📦 Box available at: https://app.vagrantup.com/${BOX_NAME}"
+        # 2) Create provider
+        echo "Adding provider $PROVIDER"
+        curl -sSX POST "${API_BASE}/boxes/${USER}/${BOX}/versions/${BOX_VERSION}/providers" \
+          -H "Authorization: Bearer $VAGRANT_CLOUD_TOKEN" \
+          -H "Content-Type: application/json" \
+          -d "{\"provider\": {\"name\": \"${PROVIDER}\"}}" | jq .
 
-      - name: Upload build artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: packer-logs-${{ steps.box-metadata.outputs.box_version }}
-          path: |
-            packer-build.log
-            *.box
-          retention-days: 7
+        # 3) Request upload URL (create an upload)
+        echo "Requesting upload target URL"
+        UPLOAD_CREATE_RESP=$(curl -sSX POST "${API_BASE}/boxes/${USER}/${BOX}/versions/${BOX_VERSION}/providers/${PROVIDER}/uploads" \
+          -H "Authorization: Bearer $VAGRANT_CLOUD_TOKEN" \
+          -H "Content-Type: application/json" \
+          -d "{}")
+        UPLOAD_PATH=$(echo "$UPLOAD_CREATE_RESP" | jq -r .upload_path)
+        UPLOAD_URL=$(echo "$UPLOAD_CREATE_RESP" | jq -r .upload_url)
+        if [ -z "$UPLOAD_URL" ] || [ "$UPLOAD_URL" = "null" ]; then
+          echo "Failed to get upload URL"
+          echo "$UPLOAD_CREATE_RESP" | jq .
+          exit 1
+        fi
+        echo "Uploading to $UPLOAD_URL"
+        # Use the provided upload_url to PUT the box file
+        curl -sSX PUT "$UPLOAD_URL" --upload-file "$BOX_FILE" -H "Content-Type: application/octet-stream"
+        echo "Upload complete"
 
-      - name: Cleanup
-        if: always()
-        run: |
-          echo "🧹 Cleaning up build artifacts..."
-          rm -f *.box
-          rm -f packer-build.log
-          rm -rf packer_cache/
-          
-          # Logout from HCP
-          hcp auth logout || true
+        # 4) Mark upload as complete
+        echo "Notifying Vagrant Cloud that upload is complete"
+        curl -sSX PUT "${API_BASE}/boxes/${USER}/${BOX}/versions/${BOX_VERSION}/providers/${PROVIDER}/uploads/complete" \
+          -H "Authorization: Bearer $VAGRANT_CLOUD_TOKEN" \
+          -H "Content-Type: application/json" \
+          -d "{}" | jq .
 
-      - name: Summary
-        if: success()
-        run: |
-          cat >> $GITHUB_STEP_SUMMARY <<EOF
-          # ✅ Vagrant Box Build and Publish Successful
-          
-          ## 📦 Box Details
-          - **Name**: \`${{ steps.box-metadata.outputs.box_name }}\`
-          - **Version**: \`${{ steps.box-metadata.outputs.box_version }}\`
-          - **Provider**: \`${{ steps.box-metadata.outputs.provider }}\`
-          - **Build Time**: $(date -u)
-          
-          ## 🔗 Links
-          - [View on Vagrant Cloud](https://app.vagrantup.com/${{ steps.box-metadata.outputs.box_name }})
-          - [Download Box](https://app.vagrantup.com/${{ steps.box-metadata.outputs.box_name }}/versions/${{ steps.box-metadata.outputs.box_version }})
-          
-          ## 📥 Usage
-          \`\`\`bash
-          vagrant init ${{ steps.box-metadata.outputs.box_name }} --box-version ${{ steps.box-metadata.outputs.box_version }}
-          vagrant up
-          \`\`\`
-          EOF
+        echo "Published box via API fallback."
+
+    - name: Cleanup generated artifacts
+      if: always()
+      run: |
+        set -euo pipefail
+        # Remove produced .box files to keep runner clean
+        find . -type f -name "*.box" -print -delete || true
+        # Optionally clear packer cache directories if you want
+        rm -rf .packer.d || true
+        echo "Cleanup done."
+
+    - name: Final status
+      if: always()
+      run: |
+        echo "Build and publish job finished. Box: ${{ steps.vars.outputs.box_name }} version ${{ steps.vars.outputs.box_version }}"
