@@ -4,7 +4,7 @@
 # - Uses packer-templage.hcl.pkr (user-provided)
 # - Publishes to Vagrant Cloud via API (no need for vagrant CLI). If you prefer vagrant CLI, modify accordingly.
 # - Auth: prefer HCP_API_TOKEN secret, fallback to OIDC exchange if HCP_OIDC_AUDIENCE + HCP_TOKEN_EXCHANGE_ENDPOINT are set
-#
+#  gfg
 name: packer-build-and-publish
 
 on:
@@ -257,3 +257,4 @@ jobs:
           find . -type f -name "*.box" -print -delete || true
           rm -rf .packer.d || true
           echo "Cleanup done."
+
