@@ -1,10 +1,4 @@
-# Workflow: Build and publish Vagrant box with Packer (HCL) and publish to Vagrant Cloud
-# - Runs on ubuntu-latest (no self-hosted runner required)
-# - Installs Packer and HCP CLI into $HOME/.local/bin and caches them by version to avoid re-downloading
-# - Uses packer-templage.hcl.pkr (user-provided)
-# - Publishes to Vagrant Cloud via API (no need for vagrant CLI). If you prefer vagrant CLI, modify accordingly.
-# - Auth: prefer HCP_API_TOKEN secret, fallback to OIDC exchange if HCP_OIDC_AUDIENCE + HCP_TOKEN_EXCHANGE_ENDPOINT are set
-#  gfg
+# Build and publish Vagrant box with Packer (HCL) on GitHub-hosted runners
 name: packer-build-and-publish
 
 on:
@@ -14,20 +8,22 @@ on:
     inputs:
       box_name:
         description: 'Full Vagrant Cloud box name (user/box). Example: myuser/mybox'
-        required: true
+        required: false
       box_version:
         description: 'Version to publish. Example: 1.0.0'
-        required: true
+        required: false
 
 permissions:
   contents: read
-  id-token: write  # needed for OIDC exchange if used
+  id-token: write
 
 env:
-  PACKER_VERSION: "1.9.3"       # Adjust if you need a different Packer version
-  HCP_CLI_VERSION: "0.1.0"      # Adjust to actual hcp-cli version you want
+  PACKER_VERSION: "1.9.3"
+  HCP_CLI_VERSION: "0.1.0"
   PACKER_TEMPLATE: "packer-templage.hcl.pkr"
-  PACKER_PROVIDER: "virtualbox" # Default provider; override via repo secret PACKER_PROVIDER if needed
+  PACKER_PROVIDER: "virtualbox"
+  # Default box name used when no input/secret is provided
+  DEFAULT_BOX_NAME: "ulrich-sun/default-box"
 
 jobs:
   build-and-publish:
@@ -37,15 +33,41 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Validate inputs
+      - name: Validate and set inputs (supports defaults)
         id: vars
         run: |
-          BOX_NAME="${{ github.event.inputs.box_name }}"
-          BOX_VERSION="${{ github.event.inputs.box_version }}"
-          if [ -z "$BOX_NAME" ] || [ -z "$BOX_VERSION" ]; then
-            echo "ERROR: box_name and box_version are required (workflow_dispatch inputs)"
-            exit 1
+          set -euo pipefail
+
+          # Get workflow inputs (may be empty)
+          BOX_NAME_INPUT="${{ github.event.inputs.box_name || '' }}"
+          BOX_VERSION_INPUT="${{ github.event.inputs.box_version || '' }}"
+
+          BOX_NAME="$BOX_NAME_INPUT"
+          BOX_VERSION="$BOX_VERSION_INPUT"
+
+          # If no box_name input, try repo secret BOX_NAME, else use DEFAULT_BOX_NAME
+          if [ -z "$BOX_NAME" ]; then
+            if [ -n "${{ secrets.BOX_NAME }}" ]; then
+              BOX_NAME="${{ secrets.BOX_NAME }}"
+            else
+              BOX_NAME="${DEFAULT_BOX_NAME}"
+            fi
           fi
+
+          # If no box_version input, try repo secret BOX_VERSION, then git tag, else short sha
+          if [ -z "$BOX_VERSION" ]; then
+            if [ -n "${{ secrets.BOX_VERSION }}" ]; then
+              BOX_VERSION="${{ secrets.BOX_VERSION }}"
+            elif [[ "${GITHUB_REF:-}" == refs/tags/* ]]; then
+              BOX_VERSION="${GITHUB_REF#refs/tags/}"
+            else
+              BOX_VERSION="auto-${GITHUB_SHA:0:7}"
+            fi
+          fi
+
+          echo "Resolved box_name=$BOX_NAME"
+          echo "Resolved box_version=$BOX_VERSION"
+
           echo "box_name=$BOX_NAME" >> $GITHUB_OUTPUT
           echo "box_version=$BOX_VERSION" >> $GITHUB_OUTPUT
 
@@ -73,7 +95,6 @@ jobs:
           echo "Downloading packer $PK_V from $URL"
           curl -fsSL -o "$TMPZIP" "$URL"
           unzip -o "$TMPZIP" -d "$HOME/.local/bin"
-          # Place into versioned cache dir so actions/cache stores a deterministic path
           mkdir -p "${{ github.workspace }}/.cache/packer/${PK_V}"
           mv "$HOME/.local/bin/packer" "${{ github.workspace }}/.cache/packer/${PK_V}/packer"
           ln -sf "${{ github.workspace }}/.cache/packer/${PK_V}/packer" "$HOME/.local/bin/packer"
@@ -104,7 +125,6 @@ jobs:
           curl -fsSL -o "$TMPZIP" "$URL"
           unzip -o "$TMPZIP" -d "$HOME/.local/bin"
           mkdir -p "${{ github.workspace }}/.cache/hcp-cli/${HC_V}"
-          # hcp-cli binary sometimes named 'hcp' or 'hcp-cli' depending on release; move any matching binary
           for bin in "$HOME/.local/bin/"hcp*; do
             if [ -f "$bin" ]; then
               mv "$bin" "${{ github.workspace }}/.cache/hcp-cli/${HC_V}/$(basename "$bin")"
@@ -116,7 +136,7 @@ jobs:
 
       - name: Verify hcp-cli installed
         run: |
-          if command -v hcp >/dev/null 2>&1; then hcp version || true; elif command -v hcp-cli >/dev/null 2>&1; then hcp-cli version || true; else echo "hcp binary not found in PATH"; exit 0; fi
+          if command -v hcp >/dev/null 2>&1; then hcp version || true; elif command -v hcp-cli >/dev/null 2>&1; then hcp-cli version || true; else echo "hcp binary not found in PATH"; fi
 
       - name: Acquire VAGRANT_CLOUD_TOKEN (HCP) — secret or OIDC exchange fallback
         id: get_token
@@ -124,16 +144,16 @@ jobs:
           ACTIONS_ID_TOKEN_REQUEST_URL: ${{ env.ACTIONS_ID_TOKEN_REQUEST_URL }}
           ACTIONS_ID_TOKEN_REQUEST_TOKEN: ${{ env.ACTIONS_ID_TOKEN_REQUEST_TOKEN }}
         run: |
-          # Prefer short-lived secret HCP_API_TOKEN if provided
+          # Prefer HCP_API_TOKEN secret
           if [ -n "${{ secrets.HCP_API_TOKEN }}" ]; then
             echo "Using provided HCP_API_TOKEN secret"
             echo "vagrant_cloud_token=${{ secrets.HCP_API_TOKEN }}" >> $GITHUB_OUTPUT
             exit 0
           fi
 
-          # If no secret, attempt OIDC exchange (requires HCP_OIDC_AUDIENCE and HCP_TOKEN_EXCHANGE_ENDPOINT set as repo secrets)
+          # Fallback to OIDC exchange if configured
           if [ -z "${{ secrets.HCP_OIDC_AUDIENCE }}" ] || [ -z "${{ secrets.HCP_TOKEN_EXCHANGE_ENDPOINT }}" ]; then
-            echo "ERROR: no HCP_API_TOKEN and no OIDC exchange configuration. Set HCP_API_TOKEN or configure OIDC and HCP_TOKEN_EXCHANGE_ENDPOINT + HCP_OIDC_AUDIENCE"
+            echo "ERROR: no HCP_API_TOKEN and no OIDC exchange configuration. Set HCP_API_TOKEN or configure OIDC and set HCP_OIDC_AUDIENCE + HCP_TOKEN_EXCHANGE_ENDPOINT"
             exit 1
           fi
 
@@ -146,7 +166,6 @@ jobs:
             exit 1
           fi
 
-          # Exchange with your configured HCP token exchange endpoint
           EXCHANGE_ENDPOINT="${{ secrets.HCP_TOKEN_EXCHANGE_ENDPOINT }}"
           RESP=$(curl -sSX POST "${EXCHANGE_ENDPOINT}" -H "Content-Type: application/json" -d "{\"subject_token\":\"$ID_TOKEN\",\"subject_token_type\":\"urn:ietf:params:oauth:token-type:jwt\"}")
           HCP_TOKEN=$(echo "$RESP" | jq -r '.access_token // .token // .value')
@@ -181,7 +200,6 @@ jobs:
             -var "box_version=${BOX_VERSION}" \
             "${{ env.PACKER_TEMPLATE }}"
 
-          # Locate produced .box
           BOX_FILE=$(find . -type f -name "*.box" -print -quit || true)
           if [ -z "$BOX_FILE" ]; then
             echo "ERROR: No .box file found after packer build"
@@ -213,19 +231,16 @@ jobs:
           USER=$(echo "$BOX_NAME" | cut -d'/' -f1)
           BOX=$(echo "$BOX_NAME" | cut -d'/' -f2)
 
-          # Create version (idempotent: API may return error if exists, continue)
           curl -fsSX POST "${API_BASE}/boxes/${USER}/${BOX}/versions" \
             -H "Authorization: Bearer $TOKEN" \
             -H "Content-Type: application/json" \
             -d "{\"version\": {\"version\": \"${BOX_VERSION}\"}}" || true
 
-          # Create provider
           curl -fsSX POST "${API_BASE}/boxes/${USER}/${BOX}/versions/${BOX_VERSION}/providers" \
             -H "Authorization: Bearer $TOKEN" \
             -H "Content-Type: application/json" \
             -d "{\"provider\": {\"name\": \"${PROVIDER}\"}}" || true
 
-          # Request upload target
           UPLOAD_CREATE_RESP=$(curl -fsSX POST "${API_BASE}/boxes/${USER}/${BOX}/versions/${BOX_VERSION}/providers/${PROVIDER}/uploads" \
             -H "Authorization: Bearer $TOKEN" \
             -H "Content-Type: application/json" \
@@ -237,12 +252,10 @@ jobs:
             exit 1
           fi
 
-          # Upload box file (PUT to upload_url)
           echo "Uploading box to upload_url..."
           curl -fsSX PUT "$UPLOAD_URL" --upload-file "$BOX_FILE" -H "Content-Type: application/octet-stream"
           echo "Upload complete"
 
-          # Notify Vagrant Cloud that upload is complete
           curl -fsSX PUT "${API_BASE}/boxes/${USER}/${BOX}/versions/${BOX_VERSION}/providers/${PROVIDER}/uploads/complete" \
             -H "Authorization: Bearer $TOKEN" \
             -H "Content-Type: application/json" \
@@ -257,4 +270,3 @@ jobs:
           find . -type f -name "*.box" -print -delete || true
           rm -rf .packer.d || true
           echo "Cleanup done."
-
