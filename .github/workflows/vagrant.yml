@@ -71,7 +71,8 @@ jobs:
 
       - name: Setup HCP CLI
         run: |
-          if ! command -v hcp &> /dev/null || [ "$(hcp version | head -n1 | awk '{print $2}')" != "${{ env.HCP_VERSION }}" ]; then
+          if ! command -v hcp &> /dev/null; then
+            echo "📦 Installing HCP CLI ${{ env.HCP_VERSION }}..."
             wget -q https://releases.hashicorp.com/hcp/${{ env.HCP_VERSION }}/hcp_${{ env.HCP_VERSION }}_linux_amd64.zip
             unzip -q hcp_${{ env.HCP_VERSION }}_linux_amd64.zip
             sudo mv hcp /usr/local/bin/
@@ -85,20 +86,25 @@ jobs:
           HCP_CLIENT_ID: ${{ secrets.HCP_CLIENT_ID }}
           HCP_CLIENT_SECRET: ${{ secrets.HCP_CLIENT_SECRET }}
         run: |
-          echo "Authenticating with HCP..."
-          hcp auth login --client-id="${HCP_CLIENT_ID}" --client-secret="${HCP_CLIENT_SECRET}"
+          echo "🔐 Authenticating with HCP..."
+          hcp auth login \
+            --client-id="${HCP_CLIENT_ID}" \
+            --client-secret="${HCP_CLIENT_SECRET}"
           
-          echo "Retrieving Vagrant Cloud token..."
-          VAGRANT_CLOUD_TOKEN=$(hcp vagrant-registry token generate --format=json | jq -r '.token')
+          echo "🎫 Retrieving HCP access token..."
+          HCP_TOKEN=$(hcp auth print-access-token)
           
-          if [ -z "$VAGRANT_CLOUD_TOKEN" ] || [ "$VAGRANT_CLOUD_TOKEN" = "null" ]; then
-            echo "❌ Failed to retrieve Vagrant Cloud token"
+          if [ -z "$HCP_TOKEN" ] || [ "$HCP_TOKEN" = "null" ]; then
+            echo "❌ Failed to retrieve HCP access token"
             exit 1
           fi
           
-          echo "✅ Successfully retrieved Vagrant Cloud token"
-          echo "VAGRANT_CLOUD_TOKEN=${VAGRANT_CLOUD_TOKEN}" >> $GITHUB_ENV
-          echo "::add-mask::${VAGRANT_CLOUD_TOKEN}"
+          TOKEN_LENGTH=$(echo "$HCP_TOKEN" | wc -c)
+          echo "✅ Successfully retrieved HCP token (${TOKEN_LENGTH} characters)"
+          
+          echo "🔄 Setting VAGRANT_CLOUD_TOKEN from HCP token..."
+          echo "VAGRANT_CLOUD_TOKEN=${HCP_TOKEN}" >> $GITHUB_ENV
+          echo "::add-mask::${HCP_TOKEN}"
 
       - name: Set box metadata
         id: box-metadata
