@@ -1,0 +1,301 @@
+name: Build and Publish Vagrant Box
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+    paths:
+      - 'packer-template.json'
+      - 'packer-template.pkr.hcl'
+      - 'scripts/**'
+      - '.github/workflows/vagrant-build.yml'
+  
+  workflow_dispatch:
+    inputs:
+      box_name:
+        description: 'Vagrant box name (e.g., username/boxname)'
+        required: true
+        type: string
+      box_version:
+        description: 'Box version (e.g., 1.0.0)'
+        required: true
+        type: string
+      provider:
+        description: 'Vagrant provider'
+        required: false
+        default: 'virtualbox'
+        type: choice
+        options:
+          - virtualbox
+          - vmware_desktop
+          - libvirt
+
+env:
+  PACKER_VERSION: '1.10.1'
+  VAGRANT_VERSION: '2.4.1'
+  HCP_VERSION: '0.4.0'
+
+jobs:
+  build-and-publish:
+    name: Build and Publish Vagrant Box
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Cache Packer plugins
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.config/packer/plugins
+            ~/.packer.d/plugins
+          key: ${{ runner.os }}-packer-${{ env.PACKER_VERSION }}-${{ hashFiles('packer-template.json', 'packer-template.pkr.hcl') }}
+          restore-keys: |
+            ${{ runner.os }}-packer-${{ env.PACKER_VERSION }}-
+
+      - name: Setup Packer
+        uses: hashicorp/setup-packer@main
+        with:
+          version: ${{ env.PACKER_VERSION }}
+
+      - name: Setup Vagrant
+        run: |
+          if ! command -v vagrant &> /dev/null || [ "$(vagrant --version | awk '{print $2}')" != "${{ env.VAGRANT_VERSION }}" ]; then
+            wget -q https://releases.hashicorp.com/vagrant/${{ env.VAGRANT_VERSION }}/vagrant_${{ env.VAGRANT_VERSION }}-1_amd64.deb
+            sudo dpkg -i vagrant_${{ env.VAGRANT_VERSION }}-1_amd64.deb
+            rm vagrant_${{ env.VAGRANT_VERSION }}-1_amd64.deb
+          fi
+          vagrant --version
+
+      - name: Setup HCP CLI
+        run: |
+          if ! command -v hcp &> /dev/null || [ "$(hcp version | head -n1 | awk '{print $2}')" != "${{ env.HCP_VERSION }}" ]; then
+            wget -q https://releases.hashicorp.com/hcp/${{ env.HCP_VERSION }}/hcp_${{ env.HCP_VERSION }}_linux_amd64.zip
+            unzip -q hcp_${{ env.HCP_VERSION }}_linux_amd64.zip
+            sudo mv hcp /usr/local/bin/
+            rm hcp_${{ env.HCP_VERSION }}_linux_amd64.zip
+          fi
+          hcp version
+
+      - name: Authenticate with HCP and get Vagrant Cloud token
+        id: hcp-auth
+        env:
+          HCP_CLIENT_ID: ${{ secrets.HCP_CLIENT_ID }}
+          HCP_CLIENT_SECRET: ${{ secrets.HCP_CLIENT_SECRET }}
+        run: |
+          echo "Authenticating with HCP..."
+          hcp auth login --client-id="${HCP_CLIENT_ID}" --client-secret="${HCP_CLIENT_SECRET}"
+          
+          echo "Retrieving Vagrant Cloud token..."
+          VAGRANT_CLOUD_TOKEN=$(hcp vagrant-registry token generate --format=json | jq -r '.token')
+          
+          if [ -z "$VAGRANT_CLOUD_TOKEN" ] || [ "$VAGRANT_CLOUD_TOKEN" = "null" ]; then
+            echo "❌ Failed to retrieve Vagrant Cloud token"
+            exit 1
+          fi
+          
+          echo "✅ Successfully retrieved Vagrant Cloud token"
+          echo "VAGRANT_CLOUD_TOKEN=${VAGRANT_CLOUD_TOKEN}" >> $GITHUB_ENV
+          echo "::add-mask::${VAGRANT_CLOUD_TOKEN}"
+
+      - name: Set box metadata
+        id: box-metadata
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            BOX_NAME="${{ inputs.box_name }}"
+            BOX_VERSION="${{ inputs.box_version }}"
+            PROVIDER="${{ inputs.provider }}"
+          else
+            # Default values for push events
+            BOX_NAME="${{ secrets.DEFAULT_BOX_NAME }}"
+            BOX_VERSION="$(date +%Y.%m.%d)-${GITHUB_SHA::7}"
+            PROVIDER="virtualbox"
+          fi
+          
+          echo "box_name=${BOX_NAME}" >> $GITHUB_OUTPUT
+          echo "box_version=${BOX_VERSION}" >> $GITHUB_OUTPUT
+          echo "provider=${PROVIDER}" >> $GITHUB_OUTPUT
+          
+          echo "📦 Box Name: ${BOX_NAME}"
+          echo "🏷️  Version: ${BOX_VERSION}"
+          echo "🔧 Provider: ${PROVIDER}"
+
+      - name: Initialize Packer
+        run: |
+          packer init .
+
+      - name: Validate Packer template
+        run: |
+          if [ -f "packer-template.pkr.hcl" ]; then
+            packer validate -var "box_version=${{ steps.box-metadata.outputs.box_version }}" packer-template.pkr.hcl
+          elif [ -f "packer-template.json" ]; then
+            packer validate -var "box_version=${{ steps.box-metadata.outputs.box_version }}" packer-template.json
+          else
+            echo "❌ No Packer template found"
+            exit 1
+          fi
+
+      - name: Build Vagrant box with Packer
+        env:
+          PACKER_LOG: 1
+          PACKER_LOG_PATH: packer-build.log
+        run: |
+          echo "🔨 Building Vagrant box..."
+          
+          if [ -f "packer-template.pkr.hcl" ]; then
+            TEMPLATE="packer-template.pkr.hcl"
+          else
+            TEMPLATE="packer-template.json"
+          fi
+          
+          packer build \
+            -var "box_version=${{ steps.box-metadata.outputs.box_version }}" \
+            -var "vagrant_cloud_token=${VAGRANT_CLOUD_TOKEN}" \
+            -force \
+            "${TEMPLATE}"
+
+      - name: Verify box file exists
+        id: verify-box
+        run: |
+          BOX_FILE=$(find . -name "*.box" -type f | head -n 1)
+          
+          if [ -z "$BOX_FILE" ]; then
+            echo "❌ No .box file found after build"
+            exit 1
+          fi
+          
+          BOX_SIZE=$(du -h "$BOX_FILE" | cut -f1)
+          echo "✅ Box file found: $BOX_FILE ($BOX_SIZE)"
+          echo "box_file=${BOX_FILE}" >> $GITHUB_OUTPUT
+
+      - name: Create or update Vagrant Cloud box
+        env:
+          VAGRANT_CLOUD_TOKEN: ${{ env.VAGRANT_CLOUD_TOKEN }}
+        run: |
+          BOX_NAME="${{ steps.box-metadata.outputs.box_name }}"
+          BOX_VERSION="${{ steps.box-metadata.outputs.box_version }}"
+          
+          # Check if box exists
+          if curl -sf -H "Authorization: Bearer ${VAGRANT_CLOUD_TOKEN}" \
+            "https://app.vagrantup.com/api/v2/box/${BOX_NAME}" > /dev/null 2>&1; then
+            echo "📦 Box exists, will create new version"
+          else
+            echo "🆕 Creating new box on Vagrant Cloud"
+            curl -X POST \
+              -H "Authorization: Bearer ${VAGRANT_CLOUD_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d "{\"box\":{\"username\":\"$(echo $BOX_NAME | cut -d'/' -f1)\",\"name\":\"$(echo $BOX_NAME | cut -d'/' -f2)\",\"is_private\":false}}" \
+              "https://app.vagrantup.com/api/v2/boxes"
+          fi
+
+      - name: Create new version
+        env:
+          VAGRANT_CLOUD_TOKEN: ${{ env.VAGRANT_CLOUD_TOKEN }}
+        run: |
+          BOX_NAME="${{ steps.box-metadata.outputs.box_name }}"
+          BOX_VERSION="${{ steps.box-metadata.outputs.box_version }}"
+          
+          echo "🏷️  Creating version ${BOX_VERSION}"
+          curl -X POST \
+            -H "Authorization: Bearer ${VAGRANT_CLOUD_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "{\"version\":{\"version\":\"${BOX_VERSION}\",\"description\":\"Built from GitHub Actions on $(date -u +%Y-%m-%d)\"}}" \
+            "https://app.vagrantup.com/api/v2/box/${BOX_NAME}/versions"
+
+      - name: Create provider
+        env:
+          VAGRANT_CLOUD_TOKEN: ${{ env.VAGRANT_CLOUD_TOKEN }}
+        run: |
+          BOX_NAME="${{ steps.box-metadata.outputs.box_name }}"
+          BOX_VERSION="${{ steps.box-metadata.outputs.box_version }}"
+          PROVIDER="${{ steps.box-metadata.outputs.provider }}"
+          
+          echo "🔧 Creating provider ${PROVIDER}"
+          curl -X POST \
+            -H "Authorization: Bearer ${VAGRANT_CLOUD_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "{\"provider\":{\"name\":\"${PROVIDER}\"}}" \
+            "https://app.vagrantup.com/api/v2/box/${BOX_NAME}/version/${BOX_VERSION}/providers"
+
+      - name: Upload box to Vagrant Cloud
+        env:
+          VAGRANT_CLOUD_TOKEN: ${{ env.VAGRANT_CLOUD_TOKEN }}
+        run: |
+          BOX_NAME="${{ steps.box-metadata.outputs.box_name }}"
+          BOX_VERSION="${{ steps.box-metadata.outputs.box_version }}"
+          PROVIDER="${{ steps.box-metadata.outputs.provider }}"
+          BOX_FILE="${{ steps.verify-box.outputs.box_file }}"
+          
+          echo "⬆️  Getting upload URL..."
+          UPLOAD_PATH=$(curl -s \
+            -H "Authorization: Bearer ${VAGRANT_CLOUD_TOKEN}" \
+            "https://app.vagrantup.com/api/v2/box/${BOX_NAME}/version/${BOX_VERSION}/provider/${PROVIDER}/upload" \
+            | jq -r '.upload_path')
+          
+          echo "📤 Uploading box file..."
+          curl -X PUT \
+            --upload-file "${BOX_FILE}" \
+            "${UPLOAD_PATH}"
+          
+          echo "✅ Upload complete"
+
+      - name: Release version
+        env:
+          VAGRANT_CLOUD_TOKEN: ${{ env.VAGRANT_CLOUD_TOKEN }}
+        run: |
+          BOX_NAME="${{ steps.box-metadata.outputs.box_name }}"
+          BOX_VERSION="${{ steps.box-metadata.outputs.box_version }}"
+          
+          echo "🚀 Releasing version ${BOX_VERSION}"
+          curl -X PUT \
+            -H "Authorization: Bearer ${VAGRANT_CLOUD_TOKEN}" \
+            "https://app.vagrantup.com/api/v2/box/${BOX_NAME}/version/${BOX_VERSION}/release"
+          
+          echo "✅ Version released successfully!"
+          echo "📦 Box available at: https://app.vagrantup.com/${BOX_NAME}"
+
+      - name: Upload build artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: packer-logs-${{ steps.box-metadata.outputs.box_version }}
+          path: |
+            packer-build.log
+            *.box
+          retention-days: 7
+
+      - name: Cleanup
+        if: always()
+        run: |
+          echo "🧹 Cleaning up build artifacts..."
+          rm -f *.box
+          rm -f packer-build.log
+          rm -rf packer_cache/
+          
+          # Logout from HCP
+          hcp auth logout || true
+
+      - name: Summary
+        if: success()
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY <<EOF
+          # ✅ Vagrant Box Build and Publish Successful
+          
+          ## 📦 Box Details
+          - **Name**: \`${{ steps.box-metadata.outputs.box_name }}\`
+          - **Version**: \`${{ steps.box-metadata.outputs.box_version }}\`
+          - **Provider**: \`${{ steps.box-metadata.outputs.provider }}\`
+          - **Build Time**: $(date -u)
+          
+          ## 🔗 Links
+          - [View on Vagrant Cloud](https://app.vagrantup.com/${{ steps.box-metadata.outputs.box_name }})
+          - [Download Box](https://app.vagrantup.com/${{ steps.box-metadata.outputs.box_name }}/versions/${{ steps.box-metadata.outputs.box_version }})
+          
+          ## 📥 Usage
+          \`\`\`bash
+          vagrant init ${{ steps.box-metadata.outputs.box_name }} --box-version ${{ steps.box-metadata.outputs.box_version }}
+          vagrant up
+          \`\`\`
+          EOF
