@@ -29,8 +29,7 @@ jobs:
       run: |
         hcp auth login \
           --client-id="${{ secrets.HCP_CLIENT_ID }}" \
-          --client-secret="${{ secrets.HCP_CLIENT_SECRET }}" \
-          --geography=eu
+          --client-secret="${{ secrets.HCP_CLIENT_SECRET }}"
 
     - name: Validate HCP authentication
       run: |
