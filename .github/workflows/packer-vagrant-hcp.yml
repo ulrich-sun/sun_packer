@@ -1,0 +1,52 @@
+name: Build & Publish Vagrant Box to HCP (Native CLI)
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Install Packer
+      uses: hashicorp/setup-packer@v2
+      with:
+        version: "1.9.0"
+
+    - name: Install HCP CLI
+      run: |
+        curl -fsSL https://releases.hashicorp.com/hcp/0.4.0/hcp_0.4.0_linux_amd64.zip -o hcp.zip
+        unzip -q hcp.zip
+        sudo mv hcp /usr/local/bin/hcp
+        hcp version
+
+    - name: Authenticate to HCP
+      run: |
+        hcp auth login \
+          --client-id="${{ secrets.HCP_CLIENT_ID }}" \
+          --client-secret="${{ secrets.HCP_CLIENT_SECRET }}" \
+          --geography=eu
+
+    - name: Validate HCP authentication
+      run: |
+        hcp auth print-access-token > /dev/null
+        echo "HCP authentication OK"
+
+    - name: Build Vagrant Box with Packer
+      run: |
+        packer init .
+        packer build template.pkr.hcl
+
+    - name: Publish Vagrant Box to HCP Registry (Native CLI)
+      run: |
+        hcp vagrant box publish \
+          --organization my-org \
+          --box ubuntu-20.04 \
+          --version 1.0.0 \
+          --provider virtualbox \
+          builds/ubuntu-20.04.box
